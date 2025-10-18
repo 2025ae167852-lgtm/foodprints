@@ -1,3 +1,7 @@
+if (process.env.NODE_ENV === 'production') {
+  console.log = function () {};
+  console.error = function () {};
+}
 var createError = require('http-errors');
 var sslRedirect = require('heroku-ssl-redirect');
 var express = require('express');
