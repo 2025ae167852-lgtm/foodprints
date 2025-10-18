@@ -1,17 +1,21 @@
-const Sequelize = require('sequelize');
-module.exports = function (sequelize, DataTypes) {
+const { DataTypes } = require('sequelize');
+
+module.exports = (sequelize) => {
   return sequelize.define(
     'FoodprintConfig',
     {
-      pk: {
-        autoIncrement: true,
+      id: {
         type: DataTypes.INTEGER,
+        autoIncrement: true,
         allowNull: false,
         primaryKey: true,
+        field: 'id' // Renamed from 'pk' to a standard primary key
       },
       configid: {
         type: DataTypes.STRING(255),
-        allowNull: true,
+        allowNull: false,
+        unique: true,
+        field: 'configid'
       },
       configname: {
         type: DataTypes.STRING(255),
@@ -27,6 +31,7 @@ module.exports = function (sequelize, DataTypes) {
       },
       logdatetime: {
         type: DataTypes.DATE,
+        defaultValue: DataTypes.NOW,
         allowNull: true,
       },
     },
@@ -36,10 +41,14 @@ module.exports = function (sequelize, DataTypes) {
       timestamps: false,
       indexes: [
         {
-          name: 'foodprint_config_PRIMARY',
+          name: 'foodprint_config_configid_key',
           unique: true,
-          using: 'BTREE',
-          fields: [{ name: 'pk' }],
+          fields: ['configid'],
+        },
+        {
+          name: 'foodprint_config_pkey',
+          unique: true,
+          fields: ['id'],
         },
       ],
     }
