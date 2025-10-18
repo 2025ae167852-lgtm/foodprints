@@ -1,352 +1,287 @@
-/**
- * Updated server.js
- * - Safe requires for optional modules
- * - Non-fatal DB handling
- * - Production-friendly logging (silence if NODE_ENV === 'production')
- * - Graceful fallback if passport/config files are missing
- * - Uses process.env.PORT for Render / Heroku compatibility
- */
+// server.js
+// Main app bootstrap for FoodPrint (robust for Render / production).
+// - Blockchain loading is disabled by default (enable via BLOCKCHAIN_ENABLED=true).
+// - Optional modules (passport localdb, blockchain route) are tolerant if missing.
 
 'use strict';
 
-// silence console in production if requested
+// Silence console in production except essential messages
 if (process.env.NODE_ENV === 'production') {
-  // If you truly want *no logs*, uncomment these lines.
-  // console.log = function () {};
-  // console.error = function () {};
+  // Keep console.error visible for critical errors but suppress normal logs.
+  console.log = function () {}; // suppress info logs
+  // Keep console.error but route it - we keep it as-is to capture errors.
 }
 
-// Load environment for non-production
-const CUSTOM_ENUMS = {
-  PRODUCTION: 'production',
-  DEVELOPMENT: 'development',
-};
-if (process.env.NODE_ENV !== CUSTOM_ENUMS.PRODUCTION) {
-  // safe to require dotenv when developing locally
-  try {
-    require('dotenv').config();
-  } catch (e) {
-    // ignore
-  }
-}
-
-// Core deps
-const express = require('express');
-const path = require('path');
-const fs = require('fs');
-const cookieParser = require('cookie-parser');
-const logger = require('morgan');
+// Basic imports
 const createError = require('http-errors');
 const sslRedirect = require('heroku-ssl-redirect');
-const cors = require('cors');
-const session = require('express-session');
+const express = require('express');
+const cookieParser = require('cookie-parser');
+const logger = require('morgan');
 const flash = require('express-flash');
+const session = require('express-session');
+const cors = require('cors');
+const path = require('path');
+const fs = require('fs');
+const passport = require('passport');
+const LocalStrategy = require('passport-local').Strategy;
 const swaggerJSDoc = require('swagger-jsdoc');
 const swaggerUi = require('swagger-ui-express');
+const CUSTOM_ENUMS = require('./utils/enums');
 
+// Load env in non-prod
+if (process.env.NODE_ENV !== CUSTOM_ENUMS.PRODUCTION) {
+  require('dotenv').config();
+}
+
+// Sequelize bootstrap (will throw if misconfigured; handled below)
+const sequelise = require('./config/db/db_sequelise');
+
+// Try to load optional localdb for passport strategies
+let dbLocal = null;
+try {
+  dbLocal = require('./config/passport/localdb');
+  console.log('Local passport DB loader found.');
+} catch (e) {
+  console.error(
+    'Warning: ./config/passport/localdb not found. Local auth strategies will be skipped.'
+  );
+  // provide a safe stub so code that references dbLocal.users doesn't crash
+  dbLocal = { users: { findByUsername: (u, cb) => cb(null, null), findById: (id, cb) => cb(null, null) } };
+}
+
+// swagger config
+const swaggerDefinition = {
+  openapi: '3.0.0',
+  info: {
+    title: 'Foodprint API',
+    version: '1.0.0',
+    description: 'Foodprint API to allow external apps to communicate with Foodprint',
+    license: { name: 'Licensed Under MIT', url: 'https://github.com/FoodPrintLabs/foodprint/blob/master/LICENSE' },
+    contact: { name: 'Foodprint Labs', url: 'https://github.com/FoodPrintLabs' },
+  },
+  servers: [{ url: 'http://localhost:3000', description: 'dev' }],
+};
+const swaggerOptions = { swaggerDefinition, apis: ['./routes/*.js'] };
+const swaggerSpecs = swaggerJSDoc(swaggerOptions);
+
+// create app
 const app = express();
 
-// helper: safe require (returns null if module not found)
-function safeRequire(p) {
-  try {
-    return require(p);
-  } catch (err) {
-    // Module not found or failed to load. Log in non-production.
-    if (process.env.NODE_ENV !== CUSTOM_ENUMS.PRODUCTION) {
-      console.error(`safeRequire: failed to load ${p}:`, err.message);
-    }
-    return null;
-  }
-}
+// mount routers list placeholders (some require files may be optional)
+let configRouter, harvestRouter, storageRouter, authRouter, blockchainRouter;
+let dashboardsRouter, qrCodeRouter, testRouter, searchRouter, apiV1Router;
+let produceRouter, buyerRouter, sellerRouter, orderRouter, emailRouter;
 
-// Database (wrap in try/catch — do not crash if misconfigured)
-let sequelise = safeRequire('./config/db/db_sequelise');
-if (!sequelise) {
-  // create a minimal stub so code referencing it won't immediately crash
-  sequelise = {
-    authenticate: async () => Promise.resolve(),
-    sync: async () => Promise.resolve(),
-  };
-}
+try { configRouter = require('./routes/config'); } catch (e) { console.error('routes/config missing'); configRouter = express.Router(); }
+try { harvestRouter = require('./routes/harvest'); } catch (e) { console.error('routes/harvest missing'); harvestRouter = express.Router(); }
+try { storageRouter = require('./routes/storage'); } catch (e) { console.error('routes/storage missing'); storageRouter = express.Router(); }
+try { authRouter = require('./routes/auth'); } catch (e) { console.error('routes/auth missing'); authRouter = express.Router(); }
+try { dashboardsRouter = require('./routes/dashboards'); } catch (e) { dashboardsRouter = express.Router(); }
+try { qrCodeRouter = require('./routes/qrcode'); } catch (e) { console.error('routes/qrcode missing'); qrCodeRouter = express.Router(); }
+try { testRouter = require('./routes/test'); } catch (e) { testRouter = express.Router(); }
+try { searchRouter = require('./routes/search'); } catch (e) { searchRouter = express.Router(); }
+try { apiV1Router = require('./routes/api_v1'); } catch (e) { apiV1Router = express.Router(); }
+try { produceRouter = require('./routes/produce'); } catch (e) { produceRouter = express.Router(); }
+try { buyerRouter = require('./routes/buyer'); } catch (e) { buyerRouter = express.Router(); }
+try { sellerRouter = require('./routes/seller'); } catch (e) { sellerRouter = express.Router(); }
+try { orderRouter = require('./routes/order'); } catch (e) { orderRouter = express.Router(); }
+try { emailRouter = require('./routes/email'); } catch (e) { emailRouter = express.Router(); }
 
-// optional passport setup (safe)
-const passport = safeRequire('passport');
-const LocalStrategy = safeRequire('passport-local') ? safeRequire('passport-local').Strategy : null;
-let passportConfigLoaded = false;
-const passportConfig = safeRequire('./config/passport');
-if (passport && passportConfig) {
+// BLOCKCHAIN: load only if enabled
+const blockchainEnabled = (process.env.BLOCKCHAIN_ENABLED || 'false').toLowerCase() === 'true';
+if (blockchainEnabled) {
   try {
-    // If the passport config is a function, call it to initialize strategies
-    if (typeof passportConfig === 'function') {
-      passportConfig(passport);
-      passportConfigLoaded = true;
-    } else {
-      passportConfigLoaded = true;
-    }
+    blockchainRouter = require('./routes/blockchain');
+    console.log('Blockchain routes enabled.');
   } catch (e) {
-    passportConfigLoaded = false;
-    if (process.env.NODE_ENV !== CUSTOM_ENUMS.PRODUCTION) {
-      console.error('Failed to initialize passport config:', e.message);
-    }
+    console.error('BLOCKCHAIN_ENABLED=true but ./routes/blockchain not found or errored. Blockchain disabled.', e.message || e);
+    blockchainRouter = express.Router();
   }
+} else {
+  console.log('Blockchain disabled by configuration (BLOCKCHAIN_ENABLED != true).');
+  blockchainRouter = express.Router(); // harmless placeholder
+  // provide a simple placeholder route that returns 501 if someone calls a blockchain endpoint
+  blockchainRouter.use((req, res, next) => {
+    // If path includes /app or /blockchain, we return not implemented
+    if (req.path && req.path.includes('/blockchain')) {
+      return res.status(501).json({ success: false, message: 'Blockchain features disabled on this deployment.' });
+    }
+    next();
+  });
 }
 
-// Routers (safe require)
-const safeRouter = name => {
-  const r = safeRequire(name);
-  return r ? r : null;
-};
-
-const configRouter = safeRouter('./routes/config');
-const harvestRouter = safeRouter('./routes/harvest');
-const storageRouter = safeRouter('./routes/storage');
-const authRouter = safeRouter('./routes/auth');
-const blockchainRouter = safeRouter('./routes/blockchain');
-const dashboardsRouter = safeRouter('./routes/dashboards');
-const qrCodeRouter = safeRouter('./routes/qrcode');
-const testRouter = safeRouter('./routes/test');
-const searchRouter = safeRouter('./routes/search');
-const apiV1Router = safeRouter('./routes/api_v1');
-const produceRouter = safeRouter('./routes/produce');
-const buyerRouter = safeRouter('./routes/buyer');
-const sellerRouter = safeRouter('./routes/seller');
-const orderRouter = safeRouter('./routes/order');
-const emailRouter = safeRouter('./routes/email');
-
-// enable ssl redirect (works on heroku, render etc)
-try {
-  app.use(sslRedirect());
-} catch (e) {
-  // ignore if not available
-}
+// enable ssl redirect for production-like envs
+app.use(sslRedirect(['production']));
 
 // view engine setup
 app.set('views', path.join(__dirname, 'views'));
 app.set('view engine', 'ejs');
 
-// Logging: Produce logs in dev, compact/error-only in prod
+// logging: create access log file and setup morgan
 const accessLogStream = fs.createWriteStream(path.join(__dirname, 'access.log'), { flags: 'a' });
-
-if (process.env.NODE_ENV === CUSTOM_ENUMS.PRODUCTION) {
-  // only log >= 400 responses
-  app.use(
-    logger('common', {
-      skip: function (req, res) {
-        return res.statusCode < 400;
-      },
-    })
-  );
+if (app.get('env') === CUSTOM_ENUMS.PRODUCTION) {
+  // only log errors in production
+  app.use(logger('common', { skip: (req, res) => res.statusCode < 400 }));
 } else {
-  // dev: log to file for inspection
   app.use(logger('dev', { stream: accessLogStream }));
 }
 
-// standard middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use(cookieParser());
 app.use(cors());
 
-// Session config (MemoryStore for now — fine for small/public testing)
-app.use(
-  session({
-    secret: process.env.SESSION_SECRET || 'SimplePass123',
-    resave: false,
-    saveUninitialized: true,
-    cookie: {
-      secure: process.env.COOKIE_SECURE === 'true' || false,
-      maxAge: parseInt(process.env.SESSION_TOKEN_LIFETIME || '3600000', 10),
-    },
-  })
-);
+// session config (keep simple; update for multi-process in production)
+app.use(session({
+  secret: process.env.SESSION_SECRET || 'default_session_secret',
+  resave: false,
+  saveUninitialized: true,
+  cookie: { maxAge: parseInt(process.env.SESSION_TOKEN_LIFETIME || '3600000', 10) }, // ms
+}));
 
-// Initialize passport if available
-if (passport) {
-  app.use(passport.initialize());
-  app.use(passport.session());
-} else {
-  // Create a minimal stub so code using 'connect-ensure-login' or passport won't crash.
-  // We'll also provide a permissive ensureLoggedIn fallback below.
-  if (process.env.NODE_ENV !== CUSTOM_ENUMS.PRODUCTION) {
-    console.warn('Passport not available; running with permissive auth.');
-  }
-}
+// passport init
+app.use(passport.initialize());
+app.use(passport.session());
+app.use(flash());
 
-// flash (safe)
-try {
-  app.use(flash());
-} catch (e) {
-  // ignore if missing
-}
-
-// Set some locals for templates (flash-safe)
-app.use(function (req, res, next) {
-  try {
-    res.locals.error = req.flash ? req.flash('error') : [];
-    res.locals.success = req.flash ? req.flash('success') : [];
-  } catch (e) {
-    // noop
-  }
+// make basic locals available in views
+app.use((req, res, next) => {
+  res.locals.error = req.flash('error');
+  res.locals.success = req.flash('success');
   next();
 });
 
-// Swagger (docs) setup (safe)
-try {
-  const swaggerDefinition = {
-    openapi: '3.0.0',
-    info: {
-      title: 'Foodprint API',
-      version: '1.0.0',
-      description: 'Foodprint API to allow external apps to communicate with Foodprint',
-    },
-    servers: [{ url: process.env.SWAGGER_BASE_URL || 'http://localhost:3000' }],
-  };
-  const swaggerOptions = {
-    swaggerDefinition,
-    apis: ['./routes/*.js'],
-  };
-  const swaggerSpecs = swaggerJSDoc(swaggerOptions);
-  app.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpecs));
-} catch (e) {
-  if (process.env.NODE_ENV !== CUSTOM_ENUMS.PRODUCTION) {
-    console.error('Swagger init failed:', e.message);
-  }
-}
+// swagger UI
+app.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpecs));
 
-// Provide a permissive ensureLoggedIn fallback if connect-ensure-login or passport not available
-let ensureLoggedIn = null;
-try {
-  const cel = safeRequire('connect-ensure-login');
-  if (cel && cel.ensureLoggedIn) {
-    ensureLoggedIn = cel.ensureLoggedIn;
-  }
-} catch (e) {
-  ensureLoggedIn = null;
-}
-if (!ensureLoggedIn) {
-  // fallback: a middleware factory that returns a middleware which allows all requests through
-  ensureLoggedIn = options => {
-    return (req, res, next) => {
-      // if you want lock-down in production, change this to enforce authentication.
-      // for now keep permissive so site remains accessible if auth is missing.
-      return next();
-    };
-  };
-}
+// Mount routers
+app.use('/', router);
+if (blockchainRouter) app.use('/', blockchainRouter);
+app.use('/app/config', configRouter);
+app.use('/app/auth', authRouter);
+app.use('/app/harvest', harvestRouter);
+app.use('/app/storage', storageRouter);
+app.use('/app/produce', produceRouter);
+app.use('/app/dashboards', dashboardsRouter);
+app.use('/app/buyer', buyerRouter);
+app.use('/app/seller', sellerRouter);
+app.use('/app/order', orderRouter);
+app.use('/app/email', emailRouter);
+app.use('/', testRouter);
+app.use('/', searchRouter);
+app.use('/app/', qrCodeRouter);
+app.use('/app/api/v1', apiV1Router);
 
-// Root router
-const mainRouter = express.Router();
-
-// Home route: try to use user info if passport present, otherwise render publicly
-mainRouter.get('/', ensureLoggedIn({ redirectTo: '/app/auth/login' }), (req, res) => {
-  try {
-    const user = req.user || null;
-    res.render('index', {
-      user,
-      page_name: 'home',
-      admin_status: user && user.role && (user.role === 'Admin' || user.role === 'Superuser'),
-    });
-  } catch (e) {
-    res.send('Foodprint backend - Welcome (index render failed).');
+// Serve multiple possible static folders (common variations)
+const staticCandidates = ['src', 'build', 'foodprint-static', 'public', 'docs'];
+staticCandidates.forEach(folderName => {
+  const full = path.join(__dirname, folderName);
+  if (fs.existsSync(full)) {
+    app.use(express.static(full));
+    console.log(`Serving static files from ${full}`);
   }
 });
 
-// Mount routers only when available
-app.use('/', mainRouter);
+// --- Passport strategies: register only if dbLocal.users is present and looks real
+if (dbLocal && dbLocal.users && typeof dbLocal.users.findByUsername === 'function') {
+  try {
+    passport.use('file-local', new LocalStrategy(
+      { usernameField: 'loginUsername', passwordField: 'loginPassword' },
+      function (username, password, cb) {
+        dbLocal.users.findByUsername(username, function (err, user) {
+          if (err) return cb(err);
+          if (!user) return cb(null, false, { message: 'Incorrect username.' });
+          if (user.password !== password) return cb(null, false, { message: 'Incorrect password.' });
+          return cb(null, user);
+        });
+      }
+    ));
+    passport.use('db-local', new LocalStrategy(
+      { usernameField: 'loginUsername', passwordField: 'loginPassword' },
+      function (username, password, cb) {
+        dbLocal.users.findByUsername(username, function (err, user) {
+          if (err) return cb(err);
+          if (!user) return cb(null, false, { message: 'Incorrect username.' });
+          if (user.password !== password) return cb(null, false, { message: 'Incorrect password.' });
+          return cb(null, user);
+        });
+      }
+    ));
 
-if (blockchainRouter) app.use('/', blockchainRouter);
-if (configRouter) app.use('/app/config', configRouter);
-if (authRouter) app.use('/app/auth', authRouter);
-if (harvestRouter) app.use('/app/harvest', harvestRouter);
-if (storageRouter) app.use('/app/storage', storageRouter);
-if (produceRouter) app.use('/app/produce', produceRouter);
-if (dashboardsRouter) app.use('/app/dashboards', dashboardsRouter);
-if (buyerRouter) app.use('/app/buyer', buyerRouter);
-if (sellerRouter) app.use('/app/seller', sellerRouter);
-if (orderRouter) app.use('/app/order', orderRouter);
-if (emailRouter) app.use('/app/email', emailRouter);
-if (testRouter) app.use('/', testRouter);
-if (searchRouter) app.use('/', searchRouter);
-if (qrCodeRouter) app.use('/app/', qrCodeRouter);
-if (apiV1Router) app.use('/app/api/v1', apiV1Router);
+    passport.serializeUser(function (user, cb) { cb(null, user.id); });
+    passport.deserializeUser(function (id, cb) {
+      dbLocal.users.findById(id, function (err, user) { if (err) return cb(err); cb(null, user); });
+    });
 
-// Serve static built frontend (docs or static folder). Prefer docs (GitHub Pages style)
-const docsPath = path.join(__dirname, 'docs');
-const staticFallback = path.join(__dirname, 'public');
-if (fs.existsSync(docsPath)) {
-  app.use(express.static(docsPath));
-} else if (fs.existsSync(staticFallback)) {
-  app.use(express.static(staticFallback));
+    console.log('Passport local strategies registered.');
+  } catch (e) {
+    console.error('Error registering passport strategies:', e && e.message ? e.message : e);
+  }
 } else {
-  // no static files - no-op
+  console.warn('Passport local strategies skipped due to missing localdb.');
 }
 
-// catch 404 and forward to error handler
+// catch 404
 app.use(function (req, res, next) {
   next(createError(404));
 });
 
-// error handler (last middleware)
+// home route (if login required, many routes use connect-ensure-login; those routes will function
+// but if auth middleware is absent they'll fail. We left auth routes mounted above.)
+router.get('/', function (req, res) {
+  // If user object missing we render publicly accessible home
+  try {
+    const user = req.user || null;
+    // if views/index.ejs missing we fallback to a static welcome page
+    if (fs.existsSync(path.join(__dirname, 'views', 'index.ejs'))) {
+      const admin_status = (user && (user.role === 'Admin' || user.role === 'Superuser'));
+      res.render('index', { user, page_name: 'home', admin_status });
+    } else {
+      res.send('<h1>FoodPrint</h1><p>Welcome. Views not present on this deployment.</p>');
+    }
+  } catch (e) {
+    console.error('Error rendering home:', e);
+    res.status(500).send('Server error');
+  }
+});
+
+// error handler
 app.use(function (err, req, res, next) {
-  // hide stack in production
+  console.error('Unhandled error:', err && (err.stack || err.message || err));
   res.locals.message = err.message;
   res.locals.error = req.app.get('env') === 'development' ? err : {};
   res.status(err.status || 500);
-
-  // Try to render error page if view exists
-  try {
-    return res.render('error', { user: req.user, page_name: 'error' });
-  } catch (e) {
-    // fallback to JSON
-    return res.json({ success: false, error: err.message });
+  if (fs.existsSync(path.join(__dirname, 'views', 'error.ejs'))) {
+    res.render('error', { user: req.user, page_name: 'error' });
+  } else {
+    res.sendStatus(err.status || 500);
   }
 });
 
-// Database connect & sync — non-fatal
-(async function initDb() {
-  try {
-    if (sequelise && typeof sequelise.authenticate === 'function') {
-      await sequelise.authenticate();
-      console.log('✅ Database connected (authenticate).');
-    }
-  } catch (err) {
-    console.error('Error connecting to database:', err && err.message ? err.message : err);
-  }
+// --- Database connect + server listen
+sequelise.authenticate()
+  .then(() => {
+    console.log('✅ Database connected successfully (PostgreSQL).');
+    return sequelise.sync(); // do not use force:true in production
+  })
+  .then(() => {
+    const PORT = process.env.PORT || 3000;
+    app.listen(PORT, () => {
+      console.log(`🚀 Server started on port ${PORT} (env=${process.env.NODE_ENV || 'development'})`);
+      if (!blockchainEnabled) {
+        console.log('Blockchain routes are currently disabled. Set BLOCKCHAIN_ENABLED=true to enable.');
+      }
+    });
+  })
+  .catch(err => {
+    // Log DB errors but keep process alive (Render will restart if necessary)
+    console.error('Database startup error:', err && (err.message || err));
+    // still try to start server even if DB sync fails (useful for static pages)
+    const PORT = process.env.PORT || 3000;
+    app.listen(PORT, () => {
+      console.log(`🚀 Server started (DB not fully available) on port ${PORT}`);
+    });
+  });
 
-  try {
-    if (sequelise && typeof sequelise.sync === 'function') {
-      await sequelise.sync();
-      console.log('✅ Database synchronized (sync).');
-    }
-  } catch (err) {
-    console.error('Error synching models:', err && err.message ? err.message : err);
-  }
-})().catch(err => {
-  if (process.env.NODE_ENV !== CUSTOM_ENUMS.PRODUCTION) {
-    console.error('Unexpected DB init error:', err);
-  }
-});
-
-// Start server
-const PORT = parseInt(process.env.PORT || '3000', 10);
-app.listen(PORT, () => {
-  console.log(`🚀 Server started on port ${PORT} (env=${process.env.NODE_ENV || 'development'})`);
-  if (process.env.NODE_ENV !== CUSTOM_ENUMS.PRODUCTION) {
-    console.log('Mounted routers:');
-    const list = [
-      blockchainRouter && 'blockchain',
-      configRouter && 'config',
-      authRouter && 'auth',
-      harvestRouter && 'harvest',
-      storageRouter && 'storage',
-      produceRouter && 'produce',
-      dashboardsRouter && 'dashboards',
-      qrCodeRouter && 'qrcode',
-      apiV1Router && 'api_v1',
-    ].filter(Boolean);
-    console.log('  ', list.join(', ') || '(none)');
-  }
-});
-
-// Export app (for tests if needed)
 module.exports = app;
