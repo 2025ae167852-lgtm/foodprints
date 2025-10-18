@@ -1,12 +1,27 @@
-const env = process.env.NODE_ENV || 'development';
-const config = require('./dbconfig')[env];
-const Sequelize = require('sequelize');
+const { Sequelize } = require('sequelize');
 
-let sequelize;
-if (process.env.DB_URL) {
-  sequelize = new Sequelize(config.url, config);
-} else {
-  sequelize = new Sequelize(config.database, config.username, config.password, config);
-}
+const connectionString = process.env.DATABASE_URL;
+const sequelize = new Sequelize(connectionString, {
+  dialect: process.env.DB_DIALECT || 'postgres',
+  protocol: 'postgres',
+  logging: false,
+  dialectOptions: {
+    ssl: process.env.DB_SSL === 'true'
+      ? {
+          require: true,
+          rejectUnauthorized: false, // Necessary for Render
+        }
+      : false,
+  },
+});
+
+sequelize
+  .authenticate()
+  .then(() => {
+    console.log('✅ Database connected successfully (PostgreSQL with SSL)');
+  })
+  .catch((err) => {
+    console.error('❌ Unable to connect to the database:', err);
+  });
 
 module.exports = sequelize;
