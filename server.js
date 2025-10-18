@@ -1,90 +1,60 @@
-// ==========================
-// ✅ Core Imports
-// ==========================
+// server.js (Minimal Production Version)
+
+require('dotenv').config(); // Load .env first
 const express = require('express');
-const session = require('express-session');
-const bodyParser = require('body-parser');
-const cors = require('cors');
 const path = require('path');
-
-// ==========================
-// ✅ Initialize Express
-// ==========================
+const fs = require('fs');
 const app = express();
-const PORT = process.env.PORT || 3000;
+const port = process.env.PORT || 3000;
 
-// ==========================
+// ✅ Database (Sequelize)
+const { sequelize } = require('./models'); // Make sure models/index.js exports sequelize
+
 // ✅ Middleware
-// ==========================
-app.use(cors());
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// 🔒 Secure session (MemoryStore is OK for dev but not production)
-app.use(
-  session({
-    secret: process.env.SESSION_SECRET || 'SUPER_SECRET_KEY',
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production', // secure cookies in production
-      maxAge: 1000 * 60 * 60 * 2 // 2 hours
+// ✅ View Engine
+app.set('views', path.join(__dirname, 'views'));
+app.set('view engine', 'ejs');
+
+// ✅ Static Files
+app.use(express.static(path.join(__dirname, 'public')));
+
+// 🔒 Disable Non-Essential Services
+// (Email, blockchain, file uploads, cron jobs, etc. removed for minimal server)
+
+// ✅ Load All Routes from /routes Folder Automatically
+const routesPath = path.join(__dirname, 'routes');
+if (fs.existsSync(routesPath)) {
+  fs.readdirSync(routesPath).forEach((file) => {
+    if (file.endsWith('.js')) {
+      const route = require(path.join(routesPath, file));
+      // Use each route with its own prefix (defined inside file)
+      app.use(route);
+      console.log(`Route loaded: ${file}`);
     }
-  })
-);
+  });
+} else {
+  console.warn('⚠️ Routes folder not found.');
+}
 
-// ==========================
-// ✅ Static Frontend Support
-// ==========================
-const staticPath = path.join(__dirname, 'foodprint-static');
-app.use(express.static(staticPath));
-
-// ==========================
-// ✅ API Routes Integration
-// ==========================
-app.use('/app/auth', require('./routes/auth'));
-app.use('/app/blockchain', require('./routes/blockchain'));
-app.use('/app/config', require('./routes/config'));
-app.use('/app/dashboards', require('./routes/dashboards'));
-app.use('/app/harvest', require('./routes/harvest'));
-app.use('/app/order', require('./routes/order'));
-app.use('/app/produce', require('./routes/produce'));
-app.use('/app/buyer', require('./routes/buyer'));
-app.use('/app/seller', require('./routes/seller'));
-app.use('/app/storage', require('./routes/storage'));
-app.use('/app/email', require('./routes/email'));
-app.use('/app/api/v1', require('./routes/api_v1'));
-app.use('/app/qrcode', require('./routes/qrcode'));
-app.use('/app/search', require('./routes/search'));
-app.use('/app/test', require('./routes/test'));
-
-// ==========================
-// ✅ Default Route
-// ==========================
+// ✅ Default Home Route
 app.get('/', (req, res) => {
-  res.sendFile(path.join(staticPath, 'index.html'));
+  res.render('index', { title: 'FoodPrint API Running' });
 });
 
-// ==========================
-// ✅ 404 Handler
-// ==========================
-app.use((req, res) => {
-  res.status(404).json({ error: 'Route not found' });
-});
+// ✅ Sync Database and Start Server
+sequelize.authenticate()
+  .then(() => {
+    console.log('✅ Database connected successfully.');
 
-// ==========================
-// ✅ Global Error Handler
-// ==========================
-app.use((err, req, res, next) => {
-  console.error('🔥 Server Error:', err.message);
-  res.status(500).json({ error: 'Internal Server Error' });
-});
+    app.listen(port, () => {
+      console.log(`🚀 Server running on port ${port}`);
+    });
+  })
+  .catch((err) => {
+    console.error('❌ Unable to connect to the database:', err);
+  });
 
-// ==========================
-// ✅ Start Server
-// ==========================
-app.listen(PORT, () => {
-  console.log(`🚀 FoodPrint Server is running on port ${PORT}`);
-  console.log(`🌐 Access it at http://localhost:${PORT}`);
-});
+module.exports = app;
